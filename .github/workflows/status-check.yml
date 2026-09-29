@@ -1,0 +1,60 @@
+name: Status check
+
+# The outside status checker for the A&B website. The app can't report its
+# own outage, so this asks from outside what a visitor and a click depend on:
+# the site's /api/health, its home page, the tracking host once there is one,
+# and each certificate's days left. A failure is asked again 90 seconds later
+# and fails the run only if it repeats; scripts/status_check.py emails
+# STATUS_ALERT_TO over the company SMTP server when a failure starts, every
+# four hours while it lasts, and once when it passes again. With the secret
+# STATUS_CHECK_TOKEN (made on the site's Settings -> Monitoring), it also
+# posts each run's result to the site's /api/status-check for the dashboard;
+# a report the site refuses is logged and fails nothing.
+#
+# The script finds its earlier runs through this file's name: keep it
+# status-check.yml. The job is skipped, and a skipped job takes no runner,
+# until the repository variable STATUS_CHECK_SITE_URL is set.
+
+on:
+  schedule:
+    # Every five minutes, GitHub's shortest. A scheduled run can start late,
+    # or be dropped under load.
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read   # the checkout
+  actions: read    # this workflow's earlier runs, the checker's only memory
+
+concurrency:
+  group: status-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check the site from outside
+    if: ${{ vars.STATUS_CHECK_SITE_URL != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts
+
+      - name: Check the site
+        # Standard library only, so nothing is installed. The script reads this
+        # step's result in earlier runs by its name: rename both together.
+        env:
+          STATUS_CHECK_SITE_URL: ${{ vars.STATUS_CHECK_SITE_URL }}
+          STATUS_CHECK_TRACKING_URL: ${{ vars.STATUS_CHECK_TRACKING_URL }}
+          STATUS_ALERT_TO: ${{ vars.STATUS_ALERT_TO }}
+          STATUS_SMTP_HOST: ${{ secrets.STATUS_SMTP_HOST }}
+          STATUS_SMTP_PORT: ${{ secrets.STATUS_SMTP_PORT }}
+          STATUS_SMTP_USERNAME: ${{ secrets.STATUS_SMTP_USERNAME }}
+          STATUS_SMTP_PASSWORD: ${{ secrets.STATUS_SMTP_PASSWORD }}
+          STATUS_SMTP_FROM: ${{ secrets.STATUS_SMTP_FROM }}
+          STATUS_CHECK_TOKEN: ${{ secrets.STATUS_CHECK_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/status_check.py

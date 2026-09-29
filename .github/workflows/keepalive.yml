@@ -1,0 +1,31 @@
+name: Keep alive
+
+# GitHub turns off a public repository's scheduled workflows after 60 days
+# with no activity in it. Once a month, this pushes an empty commit, so the
+# status check's schedule stays on. It never touches a file.
+
+on:
+  schedule:
+    - cron: "41 6 1 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  keepalive:
+    name: Keep the schedule on
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github
+
+      - name: Push an empty commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "Keep the scheduled status check on"
+          git push
