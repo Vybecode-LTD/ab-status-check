@@ -16,8 +16,15 @@ What it asks:
   `/api/health`. Never a tracking link: a GET of `/t/o/...` or `/t/c/...`
   records an open or a click (a HEAD there is refused, app/spa.py), and
   `/api/health` records nothing.
-- Each HTTPS host's certificate has at least 14 days left. Let's Encrypt
-  renews at 30, so under 14 means renewals are failing.
+- When STATUS_CHECK_PRIVACY_URLS is set (full https:// addresses, separated
+  by spaces or commas, three at most), each passes the owners' two checks on
+  the privacy page the carrier's reputation enrolment for every recruiter
+  number cites: it answers 200, and its HTML says
+  "Privacy Policy". It is asked as their curl asks, following no redirect,
+  so a redirect fails, naming where it pointed.
+- Each HTTPS host's certificate, the privacy pages' included, has at least
+  14 days left. Let's Encrypt renews at 30, so under 14 means renewals are
+  failing.
 
 One slow answer is not an incident: after any failure it waits 90 seconds and
 asks everything again, and only a second failure fails the run.
@@ -53,7 +60,7 @@ from email.message import EmailMessage
 from email.utils import format_datetime, make_msgid, parseaddr
 from http import HTTPStatus
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urljoin, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 #: The workflow that runs this script. Its earlier runs are the checker's memory.
@@ -85,6 +92,13 @@ LOOK_INTO_AT_MOST = 5
 USER_AGENT = "ab-www-status-check/1 (GitHub Actions)"
 MAX_BODY_BYTES = 65536
 
+#: The privacy page the carrier's reputation enrolment for every recruiter
+#: number cites, by full address, and what the owners' second check greps its
+#: HTML for. Their grep reads the whole page; this reads up to a megabyte.
+PRIVACY_URLS = "STATUS_CHECK_PRIVACY_URLS"
+PRIVACY_PHRASE = "Privacy Policy"
+MAX_PAGE_BYTES = 1 << 20
+
 ALERT_TO = "STATUS_ALERT_TO"
 SMTP_SECRETS = (
     "STATUS_SMTP_HOST", "STATUS_SMTP_PORT", "STATUS_SMTP_USERNAME",
@@ -98,6 +112,9 @@ REPORT_PATH = "/api/status-check"
 #: `models/status_check.py`, held equal by the tests): longer is cut here.
 REPORT_NAME_LIMIT = 80
 REPORT_DETAIL_LIMIT = 300
+#: The site keeps 12 checks a run. The site's two, the tracking host's and a
+#: certificate for each host leave room for three privacy pages: 11 in all.
+PRIVACY_URLS_MAX = 3
 #: The token travels over HTTPS only, except to this machine, for a run by hand.
 LOOPBACK = frozenset({"localhost", "127.0.0.1", "::1"})
 
@@ -115,15 +132,20 @@ CERTIFICATE_LOW_MEANS = ("Browsers will refuse the site when it expires. Let's E
                          "runbook step I6 has how this name renews.")
 CERTIFICATE_REFUSED_MEANS = "Browsers refuse the site now."
 CERTIFICATE_UNREAD_MEANS = "The certificate couldn't be read, so its days left are unknown."
+PRIVACY_MEANS = ("The carrier's reputation enrolment for every recruiter phone number cites "
+                 "this address: it must answer a plain 200 with the policy's text, never a "
+                 "redirect, or the numbers can be flagged as spam.")
 
 
 # --- asking the site ----------------------------------------------------------
 
 @dataclass(frozen=True)
 class Answer:
-    """An HTTP answer: its status and the start of its body."""
+    """An HTTP answer: its status, the start of its body, and where it points
+    when it is a redirect."""
     status: int
     body: bytes = b""
+    location: str = ""
 
 
 @dataclass(frozen=True)
@@ -137,7 +159,8 @@ class Result:
 
 
 def error_answer(error: HTTPError) -> Answer:
-    """An error status, as an answer: the status, and the start of its body."""
+    """An error status, as an answer: the status, the start of its body and,
+    for a redirect not followed, where it points."""
     body = b""
     if error.fp is not None:
         try:
@@ -146,7 +169,8 @@ def error_answer(error: HTTPError) -> Answer:
             pass  # the status is the answer; its body is only detail
         finally:
             error.close()
-    return Answer(error.code, body)
+    location = error.headers.get("Location") if error.headers is not None else None
+    return Answer(error.code, body, str(location or ""))
 
 
 def http_get(url: str) -> Answer:
@@ -160,12 +184,26 @@ def http_get(url: str) -> Answer:
         return error_answer(error)
 
 
-class KeepTheToken(HTTPRedirectHandler):
-    """Follows no redirect. urllib would carry the Authorization header to
-    wherever one points, and turn the POST into a GET."""
+class NoRedirects(HTTPRedirectHandler):
+    """Follows no redirect, so a 3xx comes back as the answer. The report
+    needs it: urllib would carry the Authorization header to wherever one
+    points, and turn the POST into a GET. So does a privacy page, which the
+    owners' check asks as it is: a redirect there is itself the failure."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
+
+
+def http_get_no_redirects(url: str) -> Answer:
+    """GET `url` as the owners' curl does, following no redirect: a 3xx is the
+    answer, with where it points. An error status is an answer; getting none
+    at all raises."""
+    request = Request(url, headers={"User-Agent": USER_AGENT, "Cache-Control": "no-cache"})
+    try:
+        with build_opener(NoRedirects).open(request, timeout=TIMEOUT_SECONDS) as response:
+            return Answer(response.status, response.read(MAX_PAGE_BYTES))
+    except HTTPError as error:
+        return error_answer(error)
 
 
 def http_post(url: str, token: str, payload: Mapping) -> Answer:
@@ -177,7 +215,7 @@ def http_post(url: str, token: str, payload: Mapping) -> Answer:
         "User-Agent": USER_AGENT,
     })
     try:
-        with build_opener(KeepTheToken).open(request, timeout=TIMEOUT_SECONDS) as response:
+        with build_opener(NoRedirects).open(request, timeout=TIMEOUT_SECONDS) as response:
             return Answer(response.status, response.read(MAX_BODY_BYTES))
     except HTTPError as error:
         return error_answer(error)
@@ -268,6 +306,44 @@ def home_page(url: str, get: Callable[[str], Answer]) -> Result:
     return Result("Home page", url, False, f"answered {status_words(answer.status)}", HOME_MEANS)
 
 
+def host_of(url: str) -> str:
+    """A web address's host, with its port unless it is HTTPS's own."""
+    parts = urlsplit(url)
+    return parts.hostname if parts.port in (None, 443) else f"{parts.hostname}:{parts.port}"
+
+
+def pointed(url: str, location: str) -> str:
+    """Where a redirect from `url` points, in words: a relative address as the
+    full one it names, and one urllib can't read as it came."""
+    location = location.strip()
+    if not location:
+        return "a redirect with no address"
+    try:
+        location = urljoin(url, location)
+    except ValueError:
+        pass
+    return f"a redirect to {clean(location, 120)}"
+
+
+def privacy_page(url: str, get: Callable[[str], Answer]) -> Result:
+    """The owners' two checks on the privacy page the carrier cites: asked
+    without following a redirect, it answers 200, and its HTML says "Privacy
+    Policy". Named for its host, so a failure says which name it was."""
+    name = f"Carrier-cited privacy page on {host_of(url)}"
+    try:
+        answer = get(url)
+    except Exception as error:
+        return Result(name, url, False, described(error), PRIVACY_MEANS)
+    if answer.status == 200 and PRIVACY_PHRASE.encode() in answer.body:
+        return Result(name, url, True, f'answered 200 with "{PRIVACY_PHRASE}" in its HTML')
+    saw = f"answered {status_words(answer.status)}"
+    if 300 <= answer.status < 400:
+        saw += f", {pointed(url, answer.location)}, not the page itself"
+    elif answer.status == 200:
+        saw += f', without "{PRIVACY_PHRASE}" in its HTML'
+    return Result(name, url, False, saw, PRIVACY_MEANS)
+
+
 def certificate(host: str, port: int, now: datetime,
                 expiry: Callable[[str, int], datetime]) -> Result:
     name = f"Certificate for {host}"
@@ -287,16 +363,19 @@ def certificate(host: str, port: int, now: datetime,
 
 @dataclass(frozen=True)
 class Config:
-    """What to ask: the site, and the tracking host when there is one."""
+    """What to ask: the site, the tracking host when there is one, and the
+    privacy page the carrier cites at each address given."""
     site_url: str
     tracking_url: str = ""
+    privacy_urls: tuple[str, ...] = ()
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> "Config":
         site = web_address(env, "STATUS_CHECK_SITE_URL")
         if not site:
             raise ValueError("STATUS_CHECK_SITE_URL isn't set, so there is nothing to check.")
-        return cls(site_url=site, tracking_url=web_address(env, "STATUS_CHECK_TRACKING_URL"))
+        return cls(site_url=site, tracking_url=web_address(env, "STATUS_CHECK_TRACKING_URL"),
+                   privacy_urls=privacy_addresses(env))
 
 
 def web_address(env: Mapping[str, str], name: str) -> str:
@@ -308,10 +387,28 @@ def web_address(env: Mapping[str, str], name: str) -> str:
     return value
 
 
+def privacy_addresses(env: Mapping[str, str]) -> tuple[str, ...]:
+    """STATUS_CHECK_PRIVACY_URLS: full https:// addresses, separated by spaces
+    or commas, each once, in the order given. Blank is none."""
+    urls: list[str] = []
+    for url in (env.get(PRIVACY_URLS) or "").replace(",", " ").split():
+        parts = urlsplit(url)
+        if parts.scheme != "https" or not parts.hostname:
+            raise ValueError(f"{PRIVACY_URLS} must be full web addresses starting https:// "
+                             f"({clean(url)!r} is not one).")
+        if url not in urls:
+            urls.append(url)
+    if len(urls) > PRIVACY_URLS_MAX:
+        raise ValueError(f"{PRIVACY_URLS} names {len(urls)} addresses, and a run's report to "
+                         f"the site has room for {PRIVACY_URLS_MAX}.")
+    return tuple(urls)
+
+
 def https_hosts(config: Config) -> list[tuple[str, int]]:
-    """Each HTTPS host once, the site's first."""
+    """Each HTTPS host once, the site's first, then the tracking host's and
+    the privacy pages'."""
     hosts: list[tuple[str, int]] = []
-    for url in (config.site_url, config.tracking_url):
+    for url in (config.site_url, config.tracking_url, *config.privacy_urls):
         parts = urlsplit(url)
         if url and parts.scheme == "https" and parts.hostname:
             host = (parts.hostname, parts.port or 443)
@@ -629,6 +726,7 @@ def say(line: str) -> None:
 class Io:
     """Everything that reaches outside the process, so tests can stand in for it."""
     get: Callable[[str], Answer] = http_get
+    get_no_redirects: Callable[[str], Answer] = http_get_no_redirects
     certificate: Callable[[str, int], datetime] = certificate_expiry
     api: Callable[[str, str], dict] = github_api
     smtp: Callable[..., smtplib.SMTP] = smtplib.SMTP
@@ -657,6 +755,7 @@ def attempt(config: Config, io: Io) -> list[Result]:
     if config.tracking_url:
         results.append(health("Tracking host", f"{config.tracking_url}/api/health",
                               io.get, TRACKING_MEANS))
+    results += [privacy_page(url, io.get_no_redirects) for url in config.privacy_urls]
     now = io.clock()
     results += [certificate(host, port, now, io.certificate) for host, port in https_hosts(config)]
     return results

@@ -3,7 +3,8 @@ name: Status check
 # The outside status checker for the A&B website. The app can't report its
 # own outage, so this asks from outside what a visitor and a click depend on:
 # the site's /api/health, its home page, the tracking host once there is one,
-# and each certificate's days left. A failure is asked again 90 seconds later
+# the privacy page the carrier cites on both of the company's names, and each
+# certificate's days left. A failure is asked again 90 seconds later
 # and fails the run only if it repeats; scripts/status_check.py emails
 # STATUS_ALERT_TO over the company SMTP server when a failure starts, every
 # four hours while it lasts, and once when it passes again. With the secret
@@ -49,6 +50,11 @@ jobs:
         env:
           STATUS_CHECK_SITE_URL: ${{ vars.STATUS_CHECK_SITE_URL }}
           STATUS_CHECK_TRACKING_URL: ${{ vars.STATUS_CHECK_TRACKING_URL }}
+          # The carrier's reputation enrolment for every recruiter number cites
+          # this page, so it is watched on both names like a health endpoint,
+          # through the company site's move to its new host too. A literal, so
+          # no repository setting needs changing.
+          STATUS_CHECK_PRIVACY_URLS: https://ashfordbriggs.com/privacy.html https://www.ashfordbriggs.com/privacy.html
           STATUS_ALERT_TO: ${{ vars.STATUS_ALERT_TO }}
           STATUS_SMTP_HOST: ${{ secrets.STATUS_SMTP_HOST }}
           STATUS_SMTP_PORT: ${{ secrets.STATUS_SMTP_PORT }}
