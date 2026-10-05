@@ -4,9 +4,11 @@ and a click depend on, and emails when the answer is no.
 
 The app cannot report its own outage: when it is down, nothing inside it runs
 to notice. `.github/workflows/status-check.yml` runs this on GitHub's
-runners, every five minutes from the checker's own public repo,
-independent of the server and of Mailgun. Standard library only, so the
-workflow installs nothing.
+runners, every five minutes, from the checker's own public repo,
+`Vybecode-LTD/ab-status-check`, where cron-job.org starts it through
+`workflow_dispatch` and GitHub's own schedule, which ran it only hours apart,
+stays as a backstop: independent of the server and of Mailgun. Standard
+library only, so the workflow installs nothing.
 
 What it asks:
 - `<site>/api/health` answers 200 with status "ok". A 503 "degraded" means the
@@ -31,9 +33,11 @@ asks everything again, and only a second failure fails the run.
 
 A failed run exits 1, so the run history shows the outage, and it emails
 STATUS_ALERT_TO over the company SMTP server, never Mailgun: when a failure
-starts, every four hours while it lasts, and once when it passes again. It
-keeps no state of its own: `alert_due` works the cadence out from the
-workflow's earlier runs, read with the run's own GITHUB_TOKEN.
+starts, every four hours while it lasts, and once the site has passed again
+for half an hour, so a site that fails and recovers by turns sends one
+incident's emails. It keeps no state of its own: `alert_due` works the
+cadence out from the workflow's earlier runs, read with the run's own
+GITHUB_TOKEN.
 
 With STATUS_CHECK_TOKEN set, the token an admin makes on the site's Settings ->
 Monitoring, it then posts each run's result to `<site>/api/status-check`, which
@@ -79,11 +83,18 @@ RETRY_AFTER_SECONDS = 90
 CERTIFICATE_DAYS_MIN = 14
 #: While a failure lasts, a reminder every four hours, as the app's alerts do.
 REMIND_EVERY = timedelta(hours=4)
-#: GitHub starts scheduled runs late, by minutes and sometimes more, so a
-#: four-hour mark counts as reached half an hour early: the fourth hourly run
-#: after the start reminds, even when the start ran late.
+#: A run can start late, by minutes when cron-job.org starts it and by hours
+#: when only GitHub's own schedule does, so a four-hour mark counts as reached
+#: half an hour early: a late start doesn't push the reminder back a run.
 SCHEDULE_SLACK = timedelta(minutes=30)
-#: Earlier runs read, newest first: about four days of hourly runs.
+#: An all-clear waits until the site has passed for this long, so a site that
+#: fails and recovers by turns sends one incident's emails, not "failing" and
+#: "passing again" every ten minutes: a failure inside it is the same incident
+#: (the developer, 2026-10-05).
+ALL_CLEAR_AFTER = timedelta(minutes=30)
+#: Earlier runs read, newest first, one page of GitHub's API: about eight hours
+#: of runs five minutes apart. A failure that began before them keeps to the
+#: clock's four-hour marks (`alert_due`).
 HISTORY_RUNS = 100
 #: Failed runs looked into, newest first, to tell one that judged the site
 #: failing from one that broke before it asked. One is usually enough.
@@ -492,8 +503,11 @@ def api_trouble(error: BaseException) -> str:
 
 def past_runs(env: Mapping[str, str], io: "Io") -> tuple[list[PastRun], bool]:
     """This workflow's earlier completed runs on this branch, newest first, and
-    whether they are all it has had. The failed runs at the head are looked
-    into, until one that judged the site failing."""
+    whether they are all it has had. The newest failed runs are looked into,
+    passes between them or not, until one that judged the site failing: a
+    failure behind a pass still counts until the site has passed for
+    `ALL_CLEAR_AFTER`, so a hiccup there must be told from the site failing.
+    Nothing behind that much passing is looked into."""
     token, repo = env.get("GITHUB_TOKEN"), env.get("GITHUB_REPOSITORY")
     if not token or not repo:
         raise HistoryUnavailable("GITHUB_TOKEN and GITHUB_REPOSITORY are set only inside GitHub Actions")
@@ -511,9 +525,18 @@ def past_runs(env: Mapping[str, str], io: "Io") -> tuple[list[PastRun], bool]:
         raise HistoryUnavailable(api_trouble(error)) from None
 
     runs = runs_from(raw, current=env.get("GITHUB_RUN_ID") or "")
-    for index, run in enumerate(runs[:LOOK_INTO_AT_MOST]):
+    looked, newest_pass = 0, None
+    for index, run in enumerate(runs):
         if not run.failed:
+            if newest_pass is None:
+                newest_pass = run.at
+            elif newest_pass - run.at >= ALL_CLEAR_AFTER:
+                break  # passing this long ended whatever came before it
+            continue
+        newest_pass = None
+        if looked == LOOK_INTO_AT_MOST:
             break
+        looked += 1
         try:
             jobs = io.api(f"{api}/repos/{repo}/actions/runs/{run.run_id}/jobs?filter=latest", token)
         except Exception:
@@ -528,11 +551,24 @@ def past_runs(env: Mapping[str, str], io: "Io") -> tuple[list[PastRun], bool]:
 
 @dataclass(frozen=True)
 class Decision:
-    """Which email this run sends, if any, and since when the failure has lasted
-    (`since_exact` is False when it began before the oldest run in sight)."""
+    """Which email this run sends, if any, since when the failure has lasted
+    (`since_exact` is False when it began before the oldest run in sight), and,
+    once the site passes again, since when it has (`recovered`)."""
     email: str | None
     since: datetime | None = None
     since_exact: bool = True
+    recovered: datetime | None = None
+
+
+@dataclass(frozen=True)
+class Incident:
+    """A failure not yet ended by `ALL_CLEAR_AFTER` of passing: its first
+    failure in sight, its newest, the first pass since that newest one if any,
+    and whether `began` is its true start rather than the oldest run in sight."""
+    began: datetime
+    last_failed: datetime
+    recovered: datetime | None
+    exact: bool
 
 
 def marks(elapsed: timedelta) -> int:
@@ -544,41 +580,66 @@ def clock_block(at: datetime) -> int:
     return int(at.timestamp() // REMIND_EVERY.total_seconds())
 
 
+def open_incident(runs: Sequence[PastRun], whole_history: bool) -> Incident | None:
+    """The incident still open at the head of `runs` (judged runs, newest
+    first), or None. Passing for `ALL_CLEAR_AFTER` ends one; a failure after a
+    shorter stretch of passing belongs to the incident before it."""
+    index = 0
+    while index < len(runs) and not runs[index].failed:
+        index += 1
+    if index == len(runs):
+        return None  # nothing failed in sight
+    if index and runs[0].at - runs[index - 1].at >= ALL_CLEAR_AFTER:
+        return None  # it passed for long enough: the all-clear has gone
+    recovered = runs[index - 1].at if index else None
+    last_failed = began = runs[index].at
+    while index < len(runs):
+        if runs[index].failed:
+            began = runs[index].at
+            index += 1
+            continue
+        newest = oldest = runs[index].at
+        while index < len(runs) and not runs[index].failed:
+            oldest = runs[index].at
+            index += 1
+        if newest - oldest >= ALL_CLEAR_AFTER:
+            return Incident(began, last_failed, recovered, exact=True)
+    return Incident(began, last_failed, recovered, exact=whole_history)
+
+
 def alert_due(failing: bool, now: datetime, past: Sequence[PastRun],
               whole_history: bool = True) -> Decision:
     """Whether this run emails, and which email: the whole cadence, with no I/O.
 
     - A failure that starts with this run: the failure email.
     - One that goes on: a reminder each time it passes another four hours since
-      it began, not every hour.
-    - A pass after a failure: one email saying so.
+      it began, not every run.
+    - Passing again: one email, once the site has passed for `ALL_CLEAR_AFTER`.
+      A failure before then is the same incident, so an unsteady site sends
+      neither a second failure email nor an all-clear until it settles.
 
     `past` holds the earlier runs that passed or failed. A run that failed
-    before it asked the site, while it is the latest, counts neither way. When
-    every run in sight failed and more lie beyond (`whole_history` False), the
-    failure's start is out of sight, and the reminders keep to the clock's
+    before it asked the site counts neither way, wherever it sits. When every
+    run in sight belongs to the incident and more lie beyond (`whole_history`
+    False), its start is out of sight, and the reminders keep to the clock's
     four-hour marks (00:00, 04:00, ... UTC) instead.
     """
-    runs = sorted(past, key=lambda run: run.at, reverse=True)
-    while runs and runs[0].failed and not runs[0].judged:
-        runs.pop(0)
-    streak: list[PastRun] = []
-    for run in runs:
-        if not run.failed:
-            break
-        streak.append(run)
-    if not streak:
+    runs = [run for run in sorted(past, key=lambda run: run.at, reverse=True)
+            if run.judged or not run.failed]
+    incident = open_incident(runs, whole_history)
+    if incident is None:
         return Decision(FAILING, since=now) if failing else Decision(None)
-
-    exact = len(streak) < len(runs) or whole_history
-    began, last = streak[-1].at, streak[0].at
-    if not failing:
-        return Decision(PASSING_AGAIN, since=began, since_exact=exact)
-    if exact:
-        due = marks(now - began) > marks(last - began)
-    else:
-        due = clock_block(now) != clock_block(last)
-    return Decision(STILL_FAILING if due else None, since=began, since_exact=exact)
+    began, exact = incident.began, incident.exact
+    if failing:
+        if exact:
+            due = marks(now - began) > marks(incident.last_failed - began)
+        else:
+            due = clock_block(now) != clock_block(incident.last_failed)
+        return Decision(STILL_FAILING if due else None, since=began, since_exact=exact)
+    recovered = incident.recovered or now
+    settled = now - recovered >= ALL_CLEAR_AFTER
+    return Decision(PASSING_AGAIN if settled else None, since=began, since_exact=exact,
+                    recovered=recovered)
 
 
 # --- the email --------------------------------------------------------------------
@@ -635,6 +696,21 @@ def lasted(decision: Decision, now: datetime) -> str:
             f"more than {duration_words(now - since)}")
 
 
+def minutes_words(span: timedelta) -> str:
+    return f"{int(span.total_seconds() // 60)} minutes"
+
+
+def failed_span(decision: Decision, now: datetime) -> str:
+    """How long a failure that has ended lasted: from its start to the first
+    pass of the stretch that ended it, the day said once when it is one day."""
+    began, ended = decision.since or now, decision.recovered or now
+    if not decision.since_exact:
+        return (f"from before {clock_words(began)}, the oldest run still in sight, to "
+                f"{clock_words(ended)}: more than {duration_words(ended - began)}")
+    start = f"{began:%H:%M}" if began.date() == ended.date() else clock_words(began)
+    return f"from {start} to {clock_words(ended)}, {duration_words(ended - began)}"
+
+
 def compose(decision: Decision, *, site: str, results: Sequence[Result], now: datetime,
             run_url: str = "", note: str = "") -> tuple[str, str]:
     """The subject and plain-text body: what failed and what it saw first,
@@ -644,8 +720,9 @@ def compose(decision: Decision, *, site: str, results: Sequence[Result], now: da
     if decision.email == PASSING_AGAIN:
         subject = "A&B website: passing its outside check again"
         lines = [
-            f"{site} passes its outside check again, as of {clock_words(now)}.",
-            f"It had been failing {lasted(decision, now)}.",
+            f"{site} passes its outside check again: every run since "
+            f"{clock_words(decision.recovered or now)} has passed.",
+            f"It had been failing {failed_span(decision, now)}.",
             "",
             "Every check passes:",
             *(f"- {result.name}, {result.target}: {result.saw}." for result in results),
@@ -666,9 +743,9 @@ def compose(decision: Decision, *, site: str, results: Sequence[Result], now: da
         if passed:
             lines += ["", "What still passes:",
                       *(f"- {result.name}, {result.target}: {result.saw}." for result in passed)]
-    lines += ["", "The checker runs every hour on GitHub, outside the server. It emails when "
-                  "a failure starts, every four hours while it lasts, and once when it passes "
-                  "again."]
+    lines += ["", "The checker runs every five minutes on GitHub, outside the server. It emails "
+                  "when a failure starts, every four hours while it lasts, and once the site has "
+                  f"passed again for {minutes_words(ALL_CLEAR_AFTER)}."]
     if note:
         lines.append(note)
     if run_url:
@@ -789,7 +866,8 @@ def alert(config: Config, env: Mapping[str, str], io: Io, results: Sequence[Resu
         decision = Decision(FAILING, since=now) if failing else Decision(None)
         if failing:
             note = ("It couldn't read its own earlier runs this time, so it can't tell whether "
-                    "this failure is new: until it can, it emails every hour the site fails.")
+                    "this failure is new: until it can, every run that finds the site failing "
+                    "emails, every five minutes.")
     else:
         decision = alert_due(failing, now, past, whole)
 
@@ -797,6 +875,10 @@ def alert(config: Config, env: Mapping[str, str], io: Io, results: Sequence[Resu
         if failing:
             io.out(f"No email this run: failing {lasted(decision, now)}, and a reminder "
                    "goes every four hours from its start.")
+        elif decision.recovered is not None:
+            io.out(f"No email yet: the site has passed since {clock_words(decision.recovered)}, "
+                   f"and the all-clear goes once it has passed for "
+                   f"{minutes_words(ALL_CLEAR_AFTER)}.")
         else:
             io.out("No email: the site passes, and no failure needs an all-clear.")
         if missing:
